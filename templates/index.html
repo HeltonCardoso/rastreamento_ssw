@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SSW Rastreamento - Sistema Profissional</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <div class="header">
+                <div>
+                    <h1>
+                        🚀 SSW Rastreamento
+                        <span class="badge">TEMPO REAL</span>
+                    </h1>
+                    <p class="subtitle">Sistema profissional de rastreamento de cargas</p>
+                </div>
+            </div>
+            
+            <!-- Área de formulário -->
+            <div id="form-area" class="form-area">
+                <!-- Opção de fonte -->
+                <div class="form-row">
+                    <div class="form-group" style="flex: 2;">
+                        <label>🔗 Fonte dos dados</label>
+                        <div style="display: flex; gap: 20px;">
+                            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                                <input type="radio" name="fonte" value="arquivo" checked onclick="toggleFonte()"> 📁 Arquivo Local
+                            </label>
+                            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                                <input type="radio" name="fonte" value="google" onclick="toggleFonte()"> 🌐 Google Sheets (configurado)
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Campo para arquivo local -->
+                <div id="campo-arquivo">
+                    <div class="form-group">
+                        <label>📁 Planilha de pedidos</label>
+                        <input type="file" id="arquivo" accept=".xlsx,.xls,.csv">
+                    </div>
+                </div>
+
+                <!-- Aviso para Google Sheets (já configurado) -->
+                <div id="campo-google" class="hidden">
+                    <div class="info-box" style="background: #e8f0fe; padding: 12px; border-radius: 12px;">
+                        <p style="margin: 0; color: #1a73e8;">✅ Google Sheets já configurado!</p>
+                        <small style="color: #5f6368;">Planilha: {{ google_sheets_url }}</small>
+                    </div>
+                </div>
+
+                <!-- Campos comuns -->
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>📝 Coluna com XML/chave</label>
+                        <input type="text" id="coluna_xml" value="xml">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>⏱️ Delay (segundos)</label>
+                        <input type="number" id="delay" value="1.5" step="0.5" min="0.5" max="5">
+                    </div>
+                    
+                    <div class="form-group">
+                        <button class="btn-primary" id="btn-iniciar" onclick="iniciarProcessamento()">▶ INICIAR</button>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Área de progresso -->
+            <div id="progresso-area" class="hidden">
+                <div class="dashboard">
+                    <div class="stat-card">
+                        <div class="stat-number entregue" id="stat-entregues">0</div>
+                        <div class="stat-label">✅ ENTREGUES</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number pendente" id="stat-pendentes">0</div>
+                        <div class="stat-label">⏳ EM TRÂNSITO</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number" id="stat-alertas">0</div>
+                        <div class="stat-label">⚠️ ALERTAS (1-3d)</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number atrasado" id="stat-atrasados">0</div>
+                        <div class="stat-label">🔴 ATRASADOS</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number devolvido" id="stat-devolvidos">0</div>
+                        <div class="stat-label">🔄 DEVOLVIDOS</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-number" id="stat-erros">0</div>
+                        <div class="stat-label">❌ ERROS</div>
+                    </div>
+                </div>
+                
+                <div class="progress-container">
+                    <div class="progress-bar" id="progress-bar"></div>
+                </div>
+                
+                <div id="status-mensagem" class="status-info"></div>
+                
+                <div class="results-grid">
+                    <div class="table-container">
+                        <div class="table-header">📋 ÚLTIMOS PROCESSADOS</div>
+                        <div class="table-content">
+                            <table id="ultimos-table">
+                                <thead>
+                                    <tr><th>Hora</th><th>Nota Fiscal</th><th>Cliente</th><th>Status</th></tr>
+                                </thead>
+                                <tbody id="ultimos-body">
+                                    <tr><td colspan="4">Aguardando processamento...</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    
+                    <div class="table-container">
+                        <div class="table-header">📊 RESUMO POR STATUS</div>
+                        <div class="table-content">
+                            <table id="resumo-status">
+                                <thead><tr><th>Status</th><th>Quantidade</th></tr></thead>
+                                <tbody id="resumo-body">
+                                    <tr><td colspan="2">Aguardando processamento...</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="action-buttons">
+                    <button onclick="cancelarProcessamento()" class="btn-danger" id="btn-cancelar" style="display: none;">⏸ CANCELAR</button>
+                    <button onclick="novoProcessamento()" class="btn-primary" id="btn-novo" style="display: none;">📁 NOVO PROCESSAMENTO</button>
+                    <div id="download-area" class="download-area"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="{{ url_for('static', filename='js/script.js') }}"></script>
+</body>
+</html>
