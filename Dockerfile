@@ -1,26 +1,18 @@
-FROM python:3.11-slim
+FROM python:3.11
 
 WORKDIR /app
 
-# Instalar dependências do sistema
-RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    python3-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Instalar numpy primeiro (versão específica)
-RUN pip install --no-cache-dir numpy==1.24.3
-
-# Copiar e instalar requirements
+# Copiar requirements
 COPY requirements.txt .
-RUN pip install --no-cache-dir --no-deps -r requirements.txt || \
+
+# Instalar dependências
+RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copiar o resto da aplicação
+# Copiar o resto
 COPY . .
 
-# Criar diretórios necessários
+# Criar diretórios
 RUN mkdir -p /app/logs /tmp/ssw_cache
 
 EXPOSE 10000
