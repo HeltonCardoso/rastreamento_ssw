@@ -3,6 +3,7 @@ Sistema de Rastreamento SSW - Versão Final com Detecção de Devoluções
 Suporte completo a JSON/XML e classificação inteligente de status
 """
 
+from gspread import worksheet
 import requests
 import pandas as pd
 from datetime import datetime
@@ -520,10 +521,12 @@ class ProcessadorSSW:
     # ------------------------------------------------------------------
 
     def gerar_relatorios(self, df: pd.DataFrame, nome_base: str):
-        """Gera relatórios Excel e CSV formatados"""
+        """Gera relatórios Excel e CSV formatados - VERSÃO OTIMIZADA PARA MEMÓRIA"""
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
-        # Estatísticas detalhadas
+        # ============================================
+        # 1. ESTATÍSTICAS (antes de modificar o df)
+        # ============================================
         entregues = df[df['status'].str.contains('ENTREGUE', na=False)].shape[0]
         devolvidos = df[df['status'].str.contains('DEVOLVIDO', na=False)].shape[0]
         atrasados = df[df['status'].str.contains('ATRASADO', na=False)].shape[0]
@@ -546,9 +549,9 @@ class ProcessadorSSW:
         self._log(f"   ❌ ERROS:            {erros}")
         self._log(f"{'='*70}\n")
         
-        # Gera Excel
-        arquivo = f"{nome_base}_rastreamento_{timestamp}.xlsx"
-        
+        # ============================================
+        # 2. PREPARA O DATAFRAME (remove colunas desnecessárias)
+        # ============================================
         ordem_colunas = [
             'nota_fiscal', 'numero_pedido', 'destinatario',
             'status', 'recomendacao', 'previsao', 'data_entrega',
@@ -564,101 +567,178 @@ class ProcessadorSSW:
         colunas_existentes = [c for c in ordem_colunas if c in df.columns]
         df_rel = df[colunas_existentes].copy()
         
+        # Libera o DataFrame original da memória (opcional, ajuda o GC)
+        del df
+        
+        # ============================================
+        # 3. GERA EXCEL USANDO OPENPYXL (LINHA POR LINHA)
+        # ============================================
+        from openpyxl import Workbook
+        from openpyxl.styles import PatternFill, Font, Alignment
+        from openpyxl.utils import get_column_letter
+        
+        arquivo = f"{nome_base}_rastreamento_{timestamp}.xlsx"
+        
         try:
-            from openpyxl import Workbook
-            from openpyxl.styles import PatternFill, Font, Alignment
-            from openpyxl.utils import get_column_letter
+            # Cria workbook
+            wb = Workbook()
+            ws = wb.active
+            ws.title = 'Rastreamento'
             
-            with pd.ExcelWriter(arquivo, engine='openpyxl') as writer:
-                df_rel.to_excel(writer, index=False, sheet_name='Rastreamento')
+            # Escreve cabeçalhos
+            header_fill = PatternFill(start_color='2F5496', end_color='2F5496', fill_type='solid')
+            header_font = Font(bold=True, color='FFFFFF')
+            
+            for col_idx, header in enumerate(colunas_existentes, 1):
+                cell = ws.cell(row=1, column=col_idx, value=header)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal='center')
+            
+            # Mapeia cores por status (pré-computado para performance)
+            def get_cor_status(status):
+                if 'ENTREGUE' in status:
+                    return CORES['ENTREGUE']
+                elif 'DEVOLVIDO' in status:
+                    return CORES['DEVOLVIDO']
+                elif 'ATRASADO' in status:
+                    return CORES['ATRASADO']
+                elif 'PREVISÃO VENCENDO' in status:
+                    if '(1' in status or '1 dia' in status:
+                        return CORES['ALERTA_1DIA']
+                    elif '(2' in status or '2 dias' in status:
+                        return CORES['ALERTA_2DIAS']
+                    else:
+                        return CORES['ALERTA_3DIAS']
+                elif 'ERRO' in status:
+                    return CORES['ERRO']
+                elif 'AGUARDANDO' in status:
+                    return CORES['SEM_DADOS']
+                else:
+                    return CORES['PADRAO']
+            
+            # ⭐ CRÍTICO: Escreve linha por linha (NÃO carrega tudo na memória)
+            linha_atual = 2
+            total_linhas = len(df_rel)
+            
+            for idx, row in enumerate(df_rel.itertuples(index=False), start=2):
+                # Escreve os valores da linha
+                for col_idx, value in enumerate(row, 1):
+                    ws.cell(row=linha_atual, column=col_idx, value=value)
                 
-                workbook = writer.book
-                worksheet = writer.sheets['Rastreamento']
+                # Aplica cor baseada no status (pega a primeira coluna ou a coluna 'status')
+                status = str(row[colunas_existentes.index('status')] if 'status' in colunas_existentes else '')
+                cor_fundo = get_cor_status(status)
                 
-                # Formata cabeçalho
-                header_fill = PatternFill(start_color='2F5496', end_color='2F5496', fill_type='solid')
-                header_font = Font(bold=True, color='FFFFFF')
+                if cor_fundo != CORES['PADRAO']:
+                    fill = PatternFill(start_color=cor_fundo, end_color=cor_fundo, fill_type='solid')
+                    for col_idx in range(1, len(colunas_existentes) + 1):
+                        ws.cell(row=linha_atual, column=col_idx).fill = fill
                 
-                for col in range(1, len(colunas_existentes) + 1):
-                    cell = worksheet.cell(row=1, column=col)
-                    cell.font = header_font
-                    cell.fill = header_fill
-                    cell.alignment = Alignment(horizontal='center')
+                linha_atual += 1
                 
-                # Aplica cores baseado no status
-                status_cores = {
-                    'ENTREGUE': CORES['ENTREGUE'],
-                    'DEVOLVIDO': CORES['DEVOLVIDO'],
-                    'ATRASADO': CORES['ATRASADO'],
-                }
-                
-                for row in range(2, len(df_rel) + 2):
-                    status = str(df.iloc[row - 2].get('status', ''))
-                    cor_fundo = CORES['PADRAO']
-                    
-                    for key, cor in status_cores.items():
-                        if key in status:
-                            cor_fundo = cor
-                            break
-                    
-                    if 'PREVISÃO VENCENDO' in status:
-                        if '(1' in status:
-                            cor_fundo = CORES['ALERTA_1DIA']
-                        elif '(2' in status:
-                            cor_fundo = CORES['ALERTA_2DIAS']
-                        else:
-                            cor_fundo = CORES['ALERTA_3DIAS']
-                    elif 'ERRO' in status:
-                        cor_fundo = CORES['ERRO']
-                    elif 'AGUARDANDO' in status:
-                        cor_fundo = CORES['SEM_DADOS']
-                    
-                    if cor_fundo != CORES['PADRAO']:
-                        fill = PatternFill(start_color=cor_fundo, end_color=cor_fundo, fill_type='solid')
-                        for col in range(1, len(colunas_existentes) + 1):
-                            worksheet.cell(row=row, column=col).fill = fill
-                
-                # Ajusta largura das colunas
-                for col in worksheet.columns:
-                    max_len = 0
-                    col_letter = get_column_letter(col[0].column)
-                    for cell in col:
-                        try:
+                # A cada 500 linhas, libera um pouco de memória
+                if linha_atual % 500 == 0:
+                    self._log(f"   Gerando Excel: {linha_atual - 1}/{total_linhas} linhas...", "debug")
+            
+            # Ajusta largura das colunas
+            for col in ws.columns:
+                max_len = 0
+                col_letter = get_column_letter(col[0].column)
+                for cell in col:
+                    try:
+                        if cell.value:
                             max_len = max(max_len, len(str(cell.value)))
-                        except:
-                            pass
-                    worksheet.column_dimensions[col_letter].width = min(max_len + 2, 50)
+                    except:
+                        pass
+                worksheet.column_dimensions[col_letter].width = min(max_len + 2, 50)
+            
+            # Salva o arquivo
+            wb.save(arquivo)
+            wb.close()
             
             self._log(f"✅ Relatório Excel gerado: {arquivo}")
             
-            # Gera CSV para Intelipost se houver entregues
+        except Exception as e:
+            self._log(f"❌ Erro ao gerar Excel: {e}", "erro")
+            # Fallback: tenta gerar CSV se Excel falhar
+            arquivo = self._gerar_csv_fallback(df_rel, nome_base, timestamp)
+        
+        # ============================================
+        # 4. GERA CSV PARA INTELIPOST (se houver entregues)
+        # ============================================
+        try:
             if entregues > 0:
                 arquivo_csv = f"{nome_base}_intelipost_{timestamp}.csv"
-                entregues_df = df[df['status'].str.contains('ENTREGUE', na=False)].copy()
                 
-                col_pedido = None
-                for col in ['numero_pedido', 'nota_fiscal', 'chave_nfe']:
-                    if col in entregues_df.columns and entregues_df[col].notna().any():
-                        col_pedido = col
-                        break
+                # Filtra apenas entregues (cria cópia pequena)
+                entregues_mask = df_rel['status'].str.contains('ENTREGUE', na=False)
                 
-                if col_pedido:
-                    pd.DataFrame({
-                        'numero_pedido': entregues_df[col_pedido],
-                        'data_entrega': entregues_df['data_entrega'],
-                        'status': 'ENTREGUE'
-                    }).to_csv(arquivo_csv, index=False, encoding='utf-8-sig')
-                    self._log(f"✅ CSV Intelipost gerado: {arquivo_csv}")
-            
-            # Gera relatório de devoluções separado
+                if entregues_mask.any():
+                    # Encontra coluna de pedido
+                    col_pedido = None
+                    for col in ['numero_pedido', 'nota_fiscal', 'chave_nfe']:
+                        if col in df_rel.columns and df_rel[col].notna().any():
+                            col_pedido = col
+                            break
+                    
+                    if col_pedido:
+                        # Cria DataFrame pequeno só com entregues
+                        entregues_df = df_rel.loc[entregues_mask, [col_pedido, 'data_entrega']].copy()
+                        entregues_df['status'] = 'ENTREGUE'
+                        entregues_df.to_csv(arquivo_csv, index=False, encoding='utf-8-sig')
+                        self._log(f"✅ CSV Intelipost gerado: {arquivo_csv}")
+                        
+                        # Libera memória
+                        del entregues_df
+        except Exception as e:
+            self._log(f"⚠️ Erro ao gerar CSV Intelipost: {e}", "aviso")
+        
+        # ============================================
+        # 5. GERA RELATÓRIO DE DEVOLUÇÕES
+        # ============================================
+        try:
             if devolvidos > 0:
                 arquivo_dev = f"{nome_base}_devolucoes_{timestamp}.csv"
-                devolvidos_df = df[df['status'].str.contains('DEVOLVIDO', na=False)].copy()
-                devolvidos_df.to_csv(arquivo_dev, index=False, encoding='utf-8-sig')
-                self._log(f"⚠️ Relatório de devoluções gerado: {arquivo_dev}")
-            
+                devolvidos_mask = df_rel['status'].str.contains('DEVOLVIDO', na=False)
+                
+                if devolvidos_mask.any():
+                    devolvidos_df = df_rel.loc[devolvidos_mask].copy()
+                    devolvidos_df.to_csv(arquivo_dev, index=False, encoding='utf-8-sig')
+                    self._log(f"⚠️ Relatório de devoluções gerado: {arquivo_dev}")
+                    
+                    # Libera memória
+                    del devolvidos_df
         except Exception as e:
-            self._log(f"❌ Erro ao gerar relatório: {e}", "erro")
+            self._log(f"⚠️ Erro ao gerar relatório de devoluções: {e}", "aviso")
+        
+        # Libera o DataFrame final da memória
+        del df_rel
+        
+        return arquivo
+
+
+    def _gerar_csv_fallback(self, df_rel: pd.DataFrame, nome_base: str, timestamp: str) -> str:
+        """Fallback: gera CSV quando o Excel falha por falta de memória"""
+        arquivo = f"{nome_base}_rastreamento_{timestamp}.csv"
+        self._log(f"⚠️ Gerando CSV como fallback (menos memória): {arquivo}", "aviso")
+        
+        # Salva CSV em chunks para economizar memória
+        chunk_size = 500
+        total_rows = len(df_rel)
+        
+        # Primeiro chunk com cabeçalho
+        df_rel.head(chunk_size).to_csv(arquivo, index=False, encoding='utf-8-sig')
+        
+        # Demais chunks em modo append
+        for start in range(chunk_size, total_rows, chunk_size):
+            df_rel.iloc[start:start + chunk_size].to_csv(
+                arquivo, mode='a', header=False, index=False, encoding='utf-8-sig'
+            )
+            self._log(f"   CSV: {min(start + chunk_size, total_rows)}/{total_rows} linhas...", "debug")
+        
+        self._log(f"✅ Relatório CSV gerado (fallback): {arquivo}")
+        return arquivo
 
 
 # ============================================

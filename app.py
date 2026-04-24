@@ -24,7 +24,7 @@ CORS(app)
 # ============================================
 # Ajuste WORKERS conforme a tolerância da API SSW ao seu IP.
 # Recomendado: entre 5 e 15. Acima de 20 pode gerar bloqueios.
-WORKERS_PADRAO = int(os.environ.get('SSW_WORKERS', 10))
+WORKERS_PADRAO = int(os.environ.get('SSW_WORKERS', 5))
 
 # ============================================
 # GOOGLE SHEETS FIXO (já configurado)
