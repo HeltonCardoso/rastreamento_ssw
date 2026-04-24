@@ -258,6 +258,9 @@ function finalizarProcessamento() {
         eventSource = null;
     }
     
+    // NÃO limpar o currentProcessId aqui!
+    // Mantenha o ID para o download
+    
     // Mostra botão de download
     document.getElementById('btn-download').style.display = 'flex';
     document.getElementById('btn-cancelar').style.display = 'none';
@@ -273,13 +276,35 @@ function finalizarProcessamento() {
 }
 
 async function baixarRelatorio() {
-    if (!currentProcessId) return;
+    if (!currentProcessId) {
+        mostrarNotificacao('❌ Nenhum processo encontrado para download', 'error');
+        return;
+    }
     
     try {
-        window.location.href = `/api/download/${currentProcessId}/excel`;
-        mostrarNotificacao('📥 Download do relatório iniciado!', 'success');
+        mostrarNotificacao('📥 Gerando relatório Excel...', 'info');
+        
+        // Abre em nova aba para evitar problemas de CORS
+        window.open(`/api/download/${currentProcessId}/excel`, '_blank');
+        
+        // Versão alternativa via fetch (fallback)
+        // const response = await fetch(`/api/download/${currentProcessId}/excel`);
+        // if (response.ok) {
+        //     const blob = await response.blob();
+        //     const url = window.URL.createObjectURL(blob);
+        //     const a = document.createElement('a');
+        //     a.href = url;
+        //     a.download = `rastreamento_${new Date().toISOString().slice(0,19)}.xlsx`;
+        //     document.body.appendChild(a);
+        //     a.click();
+        //     window.URL.revokeObjectURL(url);
+        //     a.remove();
+        // }
+        
+        mostrarNotificacao('✅ Download do relatório iniciado!', 'success');
     } catch (error) {
-        mostrarNotificacao('❌ Erro ao baixar relatório', 'error');
+        console.error('Erro no download:', error);
+        mostrarNotificacao('❌ Erro ao baixar relatório: ' + error.message, 'error');
     }
 }
 

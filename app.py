@@ -353,7 +353,7 @@ def download(pid):
         return jsonify({'erro': 'Não encontrado'}), 404
     p = processos[pid]
     if p.status != 'concluido':
-        return jsonify({'erro': 'Não concluído'}), 400
+        return jsonify({'erro': 'Processo não concluído'}), 400
     data = base64.b64decode(p.resultados['excel'])
     return send_file(
         io.BytesIO(data),
