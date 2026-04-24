@@ -1,180 +1,369 @@
-let processId = null;
+// ============================================
+// SSW DASHBOARD - SCRIPT PRINCIPAL (Google Sheets)
+// ============================================
+
 let eventSource = null;
+let currentProcessId = null;
+let statusChart = null;
+let startTime = null;
 
-function toggleFonte() {
-    const fonte = document.querySelector('input[name="fonte"]:checked').value;
-    const campoArquivo = document.getElementById('campo-arquivo');
-    const campoGoogle = document.getElementById('campo-google');
-    
-    if (fonte === 'arquivo') {
-        campoArquivo.classList.remove('hidden');
-        campoGoogle.classList.add('hidden');
-    } else {
-        campoArquivo.classList.add('hidden');
-        campoGoogle.classList.remove('hidden');
-    }
-}
+// ============================================
+// INICIALIZAÇÃO
+// ============================================
 
-function atualizarDashboard(stats) {
-    document.getElementById('stat-entregues').textContent = stats.entregues || 0;
-    document.getElementById('stat-pendentes').textContent = stats.pendentes || 0;
-    document.getElementById('stat-alertas').textContent = stats.alertas || 0;
-    document.getElementById('stat-atrasados').textContent = stats.atrasados || 0;
-    document.getElementById('stat-devolvidos').textContent = stats.devolvidos || 0;
-    document.getElementById('stat-erros').textContent = stats.erros || 0;
-}
+document.addEventListener('DOMContentLoaded', function() {
+    inicializarGrafico();
+    carregarConfiguracoes();
+    mostrarNotificacao('✅ Sistema pronto! Clique no botão para iniciar o processamento.', 'success');
+});
 
-function adicionarUltimo(ultimo) {
-    if (!ultimo) return;
-    
-    const tbody = document.getElementById('ultimos-body');
-    if (tbody.rows.length === 1 && tbody.rows[0].cells[0].textContent.includes('Aguardando')) {
-        tbody.innerHTML = '';
-    }
-    
-    const row = tbody.insertRow(0);
-    let statusClass = '';
-    if (ultimo.status.includes('ENTREGUE')) statusClass = 'status-entregue';
-    else if (ultimo.status.includes('ATRASADO')) statusClass = 'status-atrasado';
-    else if (ultimo.status.includes('PREVISÃO')) statusClass = 'status-alerta';
-    else if (ultimo.status.includes('DEVOLVIDO')) statusClass = 'status-devolvido';
-    else statusClass = 'status-transito';
-    
-    let statusDisplay = ultimo.status.length > 35 ? ultimo.status.substring(0, 32) + '...' : ultimo.status;
-    let clienteDisplay = (ultimo.destinatario || '-').length > 25 ? (ultimo.destinatario || '-').substring(0, 22) + '...' : (ultimo.destinatario || '-');
-    
-    row.innerHTML = `
-        <td>${ultimo.data_hora || ''}</td>
-        <td>${ultimo.nota_fiscal || '-'}</td>
-        <td title="${ultimo.destinatario || ''}">${clienteDisplay}</td>
-        <td><span class="status-badge ${statusClass}">${statusDisplay}</span></td>
-    `;
-}
-
-function atualizarResumo(stats) {
-    const tbody = document.getElementById('resumo-body');
-    tbody.innerHTML = '';
-    
-    const statuses = [
-        { nome: '✅ ENTREGUE', cor: '#28a745', valor: stats.entregues },
-        { nome: '⏳ EM TRÂNSITO', cor: '#ffc107', valor: stats.pendentes },
-        { nome: '⚠️ ALERTA (1-3 dias)', cor: '#fd7e14', valor: stats.alertas },
-        { nome: '🔴 ATRASADO', cor: '#dc3545', valor: stats.atrasados },
-        { nome: '🔄 DEVOLVIDO', cor: '#dc3545', valor: stats.devolvidos },
-        { nome: '❌ ERRO', cor: '#6c757d', valor: stats.erros }
-    ];
-    
-    statuses.forEach(s => {
-        if (s.valor > 0) {
-            const row = tbody.insertRow();
-            row.innerHTML = `<td style="font-weight: 500;">${s.nome}</td><td style="color: ${s.cor}; font-weight: 700;">${s.valor}</td>`;
+function inicializarGrafico() {
+    const ctx = document.getElementById('statusChart').getContext('2d');
+    statusChart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: ['Entregues', 'Em Trânsito', 'Atrasados', 'Devolvidos', 'Alertas'],
+            datasets: [{
+                label: 'Quantidade',
+                data: [0, 0, 0, 0, 0],
+                backgroundColor: ['#11998e', '#667eea', '#f5576c', '#ff6b6b', '#ff9800'],
+                borderRadius: 10
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: true,
+            plugins: { legend: { position: 'bottom' } },
+            scales: {
+                y: { beginAtZero: true, ticks: { stepSize: 1 } }
+            }
         }
     });
+}
+
+function carregarConfiguracoes() {
+    const workers = localStorage.getItem('ssw_workers');
+    const coluna = localStorage.getItem('ssw_coluna');
+    if (workers) document.getElementById('workers').value = workers;
+    if (coluna) document.getElementById('coluna_xml').value = coluna;
+}
+
+function salvarConfiguracoes() {
+    localStorage.setItem('ssw_workers', document.getElementById('workers').value);
+    localStorage.setItem('ssw_coluna', document.getElementById('coluna_xml').value);
+}
+
+// ============================================
+// PROCESSAMENTO (Google Sheets)
+// ============================================
+
+async function iniciarProcessamento() {
+    salvarConfiguracoes();
     
-    if (tbody.rows.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="2">Aguardando...</td></tr>';
+    const formData = new FormData();
+    formData.append('fonte', 'google');  // FORÇA USAR GOOGLE SHEETS
+    formData.append('coluna_xml', document.getElementById('coluna_xml').value);
+    formData.append('workers', document.getElementById('workers').value);
+    formData.append('delay', '1');
+    
+    // Desabilita botão iniciar
+    const btnIniciar = document.getElementById('btn-iniciar');
+    btnIniciar.disabled = true;
+    btnIniciar.style.opacity = '0.5';
+    btnIniciar.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+    
+    try {
+        mostrarNotificacao('🚀 Buscando dados do Google Sheets...', 'info');
+        
+        const response = await fetch('/api/processar', { 
+            method: 'POST', 
+            body: formData 
+        });
+        
+        const data = await response.json();
+        
+        if (data.erro) {
+            throw new Error(data.erro);
+        }
+        
+        currentProcessId = data.process_id;
+        startTime = Date.now();
+        
+        // Conecta ao stream
+        conectarStream(currentProcessId);
+        
+        // Mostra seção de progresso
+        document.getElementById('progress-section').style.display = 'block';
+        
+        // Troca botões
+        btnIniciar.style.display = 'none';
+        document.getElementById('btn-cancelar').style.display = 'flex';
+        
+        mostrarNotificacao('✅ Processamento iniciado! Acompanhe o progresso.', 'success');
+        
+    } catch (error) {
+        mostrarNotificacao('❌ Erro: ' + error.message, 'error');
+        btnIniciar.disabled = false;
+        btnIniciar.style.opacity = '1';
+        btnIniciar.innerHTML = '<i class="fas fa-play"></i>';
     }
 }
 
-function conectarSSE(processId) {
-    if (eventSource) eventSource.close();
+function conectarStream(processId) {
+    if (eventSource) {
+        eventSource.close();
+    }
+    
     eventSource = new EventSource(`/api/stream/${processId}`);
     
     eventSource.onmessage = function(event) {
         const data = JSON.parse(event.data);
         
-        if (data.tipo === 'atualizacao') {
-            const percentual = (data.dados.progresso / data.dados.total * 100) || 0;
-            document.getElementById('progress-bar').style.width = `${percentual}%`;
-            atualizarDashboard(data.dados.stats);
-            if (data.dados.ultimo) {
-                adicionarUltimo(data.dados.ultimo);
-                atualizarResumo(data.dados.stats);
-            }
-        } else if (data.tipo === 'inicio') {
-            document.getElementById('status-mensagem').innerHTML = `🚀 Processando ${data.dados.total} pedidos...`;
-            document.getElementById('ultimos-body').innerHTML = '';
-            document.getElementById('resumo-body').innerHTML = '';
-        } else if (data.tipo === 'concluido') {
-            document.getElementById('status-mensagem').innerHTML = `✅ Concluído! ${data.dados.stats.entregues} entregues`;
-            document.getElementById('btn-cancelar').style.display = 'none';
-            document.getElementById('btn-novo').style.display = 'inline-block';
-            carregarDownload();
-        } else if (data.tipo === 'erro') {
-            document.getElementById('status-mensagem').innerHTML = `❌ ${data.dados.mensagem}`;
-            document.getElementById('btn-cancelar').style.display = 'none';
-            document.getElementById('btn-novo').style.display = 'inline-block';
-        } else if (data.tipo === 'cancelado') {
-            document.getElementById('status-mensagem').innerHTML = `⏸️ Cancelado`;
-            document.getElementById('btn-cancelar').style.display = 'none';
-            document.getElementById('btn-novo').style.display = 'inline-block';
+        switch(data.tipo) {
+            case 'inicio':
+                atualizarProgresso(0, data.total);
+                mostrarNotificacao(`📊 Encontrados ${data.total} pedidos para processar`, 'info');
+                break;
+                
+            case 'atualizacao':
+                atualizarDashboard(data.dados);
+                atualizarProgresso(data.dados.progresso, data.dados.total);
+                adicionarUltimoProcessado(data.dados.ultimo);
+                break;
+                
+            case 'concluido':
+                finalizarProcessamento();
+                break;
+                
+            case 'cancelado':
+                resetarInterface();
+                mostrarNotificacao('⚠️ Processamento cancelado!', 'warning');
+                break;
+        }
+    };
+    
+    eventSource.onerror = function(error) {
+        console.error('Erro no stream:', error);
+        if (eventSource.readyState === EventSource.CLOSED) {
+            console.log('Conexão fechada');
         }
     };
 }
 
-async function carregarDownload() {
-    try {
-        const res = await fetch(`/api/resultado/${processId}`);
-        const data = await res.json();
-        document.getElementById('download-area').innerHTML = `<a href="/api/download/${processId}/excel">📊 Baixar Relatório Excel</a>`;
-    } catch(e) { console.error(e); }
-}
-
-async function iniciarProcessamento() {
-    const fonte = document.querySelector('input[name="fonte"]:checked').value;
-    const coluna_xml = document.getElementById('coluna_xml').value;
-    const delay = document.getElementById('delay').value;
+function atualizarDashboard(dados) {
+    const stats = dados.stats;
     
-    const formData = new FormData();
-    formData.append('fonte', fonte);
-    formData.append('coluna_xml', coluna_xml);
-    formData.append('delay', delay);
+    // Atualiza métricas
+    document.getElementById('metric-entregues').textContent = stats.entregues || 0;
+    document.getElementById('metric-transito').textContent = stats.pendentes || 0;
+    document.getElementById('metric-alerta').textContent = stats.alertas || 0;
+    document.getElementById('metric-atrasados').textContent = stats.atrasados || 0;
+    document.getElementById('metric-devolvidos').textContent = stats.devolvidos || 0;
+    document.getElementById('metric-erros').textContent = stats.erros || 0;
     
-    if (fonte === 'arquivo') {
-        const arquivo = document.getElementById('arquivo').files[0];
-        if (!arquivo) { alert('Selecione um arquivo!'); return; }
-        formData.append('arquivo', arquivo);
+    // Atualiza gráfico
+    if (statusChart) {
+        statusChart.data.datasets[0].data = [
+            stats.entregues || 0,
+            stats.pendentes || 0,
+            stats.atrasados || 0,
+            stats.devolvidos || 0,
+            stats.alertas || 0
+        ];
+        statusChart.update();
     }
     
-    const btn = document.getElementById('btn-iniciar');
-    btn.disabled = true;
-    btn.textContent = '⏳ PROCESSANDO...';
+    // Adiciona alerta se necessário
+    if (dados.ultimo && (dados.ultimo.status.includes('ATRASADO') || dados.ultimo.status.includes('PREVISÃO'))) {
+        adicionarAlerta(dados.ultimo);
+    }
+}
+
+function adicionarAlerta(alerta) {
+    const tbody = document.getElementById('alertas-body');
+    
+    if (tbody.children.length === 1 && tbody.children[0].innerHTML.includes('Nenhum alerta')) {
+        tbody.innerHTML = '';
+    }
+    
+    const diasMatch = alerta.status.match(/(\d+)\s*dias?/);
+    const dias = diasMatch ? diasMatch[1] : '-';
+    
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+        <td>${alerta.nota_fiscal || '-'}</td>
+        <td><span class="status-badge status-${getStatusClass(alerta.status)}">${alerta.status}</span></td>
+        <td>${alerta.previsao || '-'}</td>
+        <td>${dias}</td>
+    `;
+    
+    tbody.insertBefore(tr, tbody.firstChild);
+    
+    while (tbody.children.length > 10) {
+        tbody.removeChild(tbody.lastChild);
+    }
+}
+
+function atualizarProgresso(atual, total) {
+    const percentual = total > 0 ? (atual / total * 100) : 0;
+    const progressBar = document.getElementById('progress-bar');
+    
+    progressBar.style.width = `${percentual}%`;
+    progressBar.textContent = `${Math.round(percentual)}%`;
+    
+    document.getElementById('progress-current').textContent = `${atual} de ${total}`;
+    document.getElementById('progress-total').textContent = `Total: ${total}`;
+    
+    if (startTime && atual > 0) {
+        const elapsed = (Date.now() - startTime) / 1000;
+        const speed = (atual / elapsed).toFixed(1);
+        document.getElementById('progress-speed').textContent = `${speed} req/s`;
+    }
+}
+
+function adicionarUltimoProcessado(ultimo) {
+    const tbody = document.getElementById('ultimos-body');
+    
+    if (tbody.children.length === 1 && tbody.children[0].innerHTML.includes('Aguardando')) {
+        tbody.innerHTML = '';
+    }
+    
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+        <td>${ultimo.data_hora || '-'}</td>
+        <td>${ultimo.nota_fiscal || '-'}</td>
+        <td>${(ultimo.destinatario || '-').substring(0, 25)}</td>
+        <td><span class="status-badge status-${getStatusClass(ultimo.status)}">${ultimo.status}</span></td>
+    `;
+    
+    tbody.insertBefore(tr, tbody.firstChild);
+    
+    while (tbody.children.length > 10) {
+        tbody.removeChild(tbody.lastChild);
+    }
+}
+
+function getStatusClass(status) {
+    if (status.includes('ENTREGUE')) return 'entregue';
+    if (status.includes('ATRASADO')) return 'atrasado';
+    if (status.includes('DEVOLVIDO')) return 'devolvido';
+    if (status.includes('PREVISÃO')) return 'alerta';
+    if (status.includes('ERRO')) return 'erro';
+    return 'transito';
+}
+
+function finalizarProcessamento() {
+    if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+    }
+    
+    // Mostra botão de download
+    document.getElementById('btn-download').style.display = 'flex';
+    document.getElementById('btn-cancelar').style.display = 'none';
+    
+    // Restaura botão iniciar
+    const btnIniciar = document.getElementById('btn-iniciar');
+    btnIniciar.style.display = 'flex';
+    btnIniciar.disabled = false;
+    btnIniciar.style.opacity = '1';
+    btnIniciar.innerHTML = '<i class="fas fa-play"></i>';
+    
+    mostrarNotificacao('✅ Processamento concluído! Clique no botão verde para baixar o relatório.', 'success');
+}
+
+async function baixarRelatorio() {
+    if (!currentProcessId) return;
     
     try {
-        const res = await fetch('/api/processar', { method: 'POST', body: formData });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.erro);
-        
-        processId = data.process_id;
-        document.getElementById('form-area').classList.add('hidden');
-        document.getElementById('progresso-area').classList.remove('hidden');
-        document.getElementById('btn-cancelar').style.display = 'inline-block';
-        conectarSSE(processId);
-    } catch (err) {
-        alert('Erro: ' + err.message);
-        btn.disabled = false;
-        btn.textContent = '▶ INICIAR';
+        window.location.href = `/api/download/${currentProcessId}/excel`;
+        mostrarNotificacao('📥 Download do relatório iniciado!', 'success');
+    } catch (error) {
+        mostrarNotificacao('❌ Erro ao baixar relatório', 'error');
     }
 }
 
 async function cancelarProcessamento() {
-    if (!processId) return;
-    await fetch(`/api/cancelar/${processId}`, { method: 'POST' });
+    mostrarModal('Tem certeza que deseja cancelar o processamento?', async () => {
+        if (!currentProcessId) return;
+        
+        try {
+            await fetch(`/api/cancelar/${currentProcessId}`, { method: 'POST' });
+            resetarInterface();
+            mostrarNotificacao('⚠️ Processamento cancelado!', 'warning');
+        } catch (error) {
+            mostrarNotificacao('❌ Erro ao cancelar', 'error');
+        }
+    });
 }
 
-function novoProcessamento() {
-    if (eventSource) eventSource.close();
-    if (processId) fetch(`/api/limpar/${processId}`, { method: 'DELETE' });
+function resetarInterface() {
+    if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+    }
     
-    document.getElementById('form-area').classList.remove('hidden');
-    document.getElementById('progresso-area').classList.add('hidden');
-    document.getElementById('arquivo').value = '';
-    document.getElementById('download-area').innerHTML = '';
-    document.getElementById('btn-iniciar').disabled = false;
-    document.getElementById('btn-iniciar').textContent = '▶ INICIAR';
-    document.getElementById('ultimos-body').innerHTML = '<tr><td colspan="4">Aguardando...</td></tr>';
-    document.getElementById('resumo-body').innerHTML = '<tr><td colspan="2">Aguardando...</td></tr>';
-    document.getElementById('progress-bar').style.width = '0%';
-    document.getElementById('status-mensagem').innerHTML = '';
-    atualizarDashboard({ entregues:0, pendentes:0, alertas:0, atrasados:0, devolvidos:0, erros:0 });
+    currentProcessId = null;
+    startTime = null;
+    
+    document.getElementById('progress-section').style.display = 'none';
+    document.getElementById('btn-download').style.display = 'none';
+    document.getElementById('btn-cancelar').style.display = 'none';
+    
+    const btnIniciar = document.getElementById('btn-iniciar');
+    btnIniciar.style.display = 'flex';
+    btnIniciar.disabled = false;
+    btnIniciar.style.opacity = '1';
+    btnIniciar.innerHTML = '<i class="fas fa-play"></i>';
+}
+
+function carregarDadosHistorico() {
+    // Função para recarregar dados históricos se necessário
+    mostrarNotificacao('🔄 Atualizando dashboard...', 'info');
+}
+
+// ============================================
+// MODAL E NOTIFICAÇÕES
+// ============================================
+
+function mostrarModal(mensagem, onConfirm) {
+    const modal = document.getElementById('modal');
+    const modalMessage = document.getElementById('modal-message');
+    const confirmBtn = document.getElementById('modal-confirm');
+    
+    modalMessage.textContent = mensagem;
+    modal.style.display = 'flex';
+    
+    const handler = () => {
+        onConfirm();
+        fecharModal();
+        confirmBtn.removeEventListener('click', handler);
+    };
+    
+    confirmBtn.addEventListener('click', handler);
+}
+
+function fecharModal() {
+    document.getElementById('modal').style.display = 'none';
+}
+
+function mostrarNotificacao(mensagem, tipo) {
+    const notif = document.createElement('div');
+    notif.className = 'notification';
+    
+    const cores = {
+        success: '#11998e',
+        error: '#dc3545',
+        warning: '#ff9800',
+        info: '#667eea'
+    };
+    
+    notif.innerHTML = `
+        <div style="background: white; padding: 12px 20px; border-radius: 10px; box-shadow: 0 5px 15px rgba(0,0,0,0.2); border-left: 4px solid ${cores[tipo] || '#667eea'};">
+            ${mensagem}
+        </div>
+    `;
+    
+    document.body.appendChild(notif);
+    setTimeout(() => notif.remove(), 4000);
 }

@@ -1,16 +1,18 @@
 """
-Sistema de Rastreamento SSW - Versão CLI e Web
-Use este mesmo arquivo para ambos: linha de comando e web
+Sistema de Rastreamento SSW - Versão Final com Detecção de Devoluções
+Suporte completo a JSON/XML e classificação inteligente de status
 """
 
 import requests
-from bs4 import BeautifulSoup
 import pandas as pd
 from datetime import datetime
 import time
 import os
 import re
-from typing import Dict, List, Optional, Tuple
+import threading
+import json
+from typing import Dict, List, Optional, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 from pathlib import Path
 import warnings
@@ -20,7 +22,6 @@ warnings.filterwarnings('ignore')
 # CONFIGURAÇÕES
 # ============================================
 
-# Configuração de logging padrão
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -33,42 +34,65 @@ logger = logging.getLogger(__name__)
 
 # Cores para Excel
 CORES = {
-    'ENTREGUE': 'E3F2E3',
-    'ALERTA_3DIAS': 'FFF3CD',
-    'ALERTA_2DIAS': 'FFE5B4',
-    'ALERTA_1DIA': 'FFD8B1',
-    'ATRASADO': 'FFE0E0',
-    'DEVOLVIDO': 'FFB6B6',
-    'SEM_DADOS': 'F0F0F0',
-    'ERRO': 'FFCCCC',
-    'PADRAO': 'FFFFFF'
+    'ENTREGUE':    'E3F2E3',      # Verde claro
+    'DEVOLVIDO':   'FFB6B6',      # Vermelho claro
+    'ATRASADO':    'FFE0E0',      # Vermelho mais claro
+    'ALERTA_1DIA': 'FFD8B1',      # Laranja claro
+    'ALERTA_2DIAS': 'FFE5B4',     # Laranja mais claro
+    'ALERTA_3DIAS': 'FFF3CD',     # Amarelo
+    'SEM_DADOS':   'F0F0F0',      # Cinza
+    'ERRO':        'FFCCCC',      # Vermelho erro
+    'PADRAO':      'FFFFFF'       # Branco
 }
 
+# ============================================
+# PROCESSADOR SSW
+# ============================================
+
 class ProcessadorSSW:
-    """
-    Classe principal para processamento de rastreamento SSW
-    """
-    
-    def __init__(self, delay_consultas: float = 1.5, callback_log=None):
-        """
-        Inicializa o processador
-        
-        Args:
-            delay_consultas: Tempo entre consultas
-            callback_log: Função para logs (opcional, para interface web)
-        """
+    API_URL = "https://ssw.inf.br/api/trackingdanfe"
+
+    def __init__(
+        self,
+        delay_consultas: float = 0.0,
+        workers: int = 5,
+        timeout: int = 30,
+        max_retries: int = 2,
+        callback_log=None
+    ):
         self.delay = delay_consultas
+        self.workers = workers
+        self.timeout = timeout
+        self.max_retries = max_retries
         self.callback_log = callback_log
+
         self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'User-Agent': 'SSWRastreamento/3.0'
         }
-        self.base_url = "https://ssw.inf.br/app/tracking"
+
+        self._lock = threading.Lock()
         self.total_consultas = 0
         self.total_erros = 0
         self.total_sem_dados = 0
-        
+        self.total_sucessos = 0
+        self._local = threading.local()
+
+    def _session(self) -> requests.Session:
+        if not hasattr(self._local, 'session'):
+            s = requests.Session()
+            s.headers.update(self.headers)
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=20,
+                pool_maxsize=20,
+                max_retries=2
+            )
+            s.mount('https://', adapter)
+            self._local.session = s
+        return self._local.session
+
     def _log(self, mensagem: str, nivel: str = "info"):
-        """Envia log para callback ou para o logger padrão"""
         if self.callback_log:
             self.callback_log(mensagem, nivel)
         else:
@@ -78,37 +102,39 @@ class ProcessadorSSW:
                 logger.warning(mensagem)
             else:
                 logger.info(mensagem)
-    
-    # ============================================
-    # SEUS MÉTODOS EXISTENTES (copie exatamente como estão)
-    # ============================================
-    
+
+    def _inc(self, campo: str):
+        with self._lock:
+            setattr(self, campo, getattr(self, campo) + 1)
+
     def extrair_chave_nfe(self, texto) -> Optional[str]:
-        """Extrai a chave de 44 dígitos"""
+        """Extrai chave de 44 dígitos de diferentes formatos"""
         if pd.isna(texto) or not texto:
             return None
         
         texto = str(texto).strip()
         
+        # Caso 1: URL completa do tracking
         if 'ssw.inf.br/app/tracking/' in texto:
             chave = texto.split('tracking/')[-1].split('?')[0].split('#')[0]
             if len(chave) >= 44:
                 return chave[:44]
         
-        chave = re.sub(r'[^0-9]', '', texto)
-        if len(chave) == 44:
-            return chave
+        # Caso 2: Apenas números
+        numeros = re.sub(r'[^0-9]', '', texto)
+        if len(numeros) == 44:
+            return numeros
         
-        numeros = re.findall(r'\d{44}', texto)
-        if numeros:
-            return numeros[0]
+        # Caso 3: Regex para 44 dígitos consecutivos
+        match = re.search(r'\d{44}', texto)
+        if match:
+            return match.group(0)
         
         return None
-    
+
     def ler_planilha(self, caminho_arquivo: str, coluna_xml: str) -> pd.DataFrame:
-        """Lê a planilha de entrada"""
+        """Lê planilha e extrai chaves"""
         self._log(f"📂 Lendo arquivo: {caminho_arquivo}")
-        
         ext = Path(caminho_arquivo).suffix.lower()
         
         try:
@@ -118,578 +144,558 @@ class ProcessadorSSW:
                 df = pd.read_excel(caminho_arquivo)
             else:
                 raise ValueError(f"Formato não suportado: {ext}")
-            
+
             if coluna_xml not in df.columns:
-                raise ValueError(f"Coluna '{coluna_xml}' não encontrada")
-            
+                raise ValueError(f"Coluna '{coluna_xml}' não encontrada. Disponíveis: {df.columns.tolist()}")
+
             df['chave_nfe'] = df[coluna_xml].apply(self.extrair_chave_nfe)
-            
             total = len(df)
             validas = df['chave_nfe'].notna().sum()
             self._log(f"✅ Chaves válidas: {validas}/{total}")
             
+            # Mostra amostra das primeiras chaves
+            for i, row in df.head(3).iterrows():
+                if pd.notna(row['chave_nfe']):
+                    self._log(f"   Exemplo {i+1}: {row['chave_nfe']}", "debug")
+            
             return df.dropna(subset=['chave_nfe'])
             
         except Exception as e:
-            self._log(f"❌ Erro: {e}", "erro")
+            self._log(f"❌ Erro ao ler planilha: {e}", "erro")
             raise
-    
-    def verificar_pagina_sem_dados(self, soup: BeautifulSoup) -> bool:
-        """Verifica se a página retornou 'Parâmetros insuficientes'"""
-        texto_pagina = soup.get_text().upper()
-        frases_sem_dados = [
-            'PARÂMETROS INSUFICIENTES PARA PESQUISA',
-            'PARAMETROS INSUFICIENTES PARA PESQUISA',
-            'NENHUM DADO ENCONTRADO',
-            'RASTREAMENTO NÃO ENCONTRADO'
-        ]
+
+    def extrair_previsao_entrega(self, eventos: List[Dict]) -> tuple:
+        """
+        Extrai a data de previsão dos eventos
+        Retorna: (data_previsao_str, dias_restantes)
+        """
+        previsao_str = ""
         
-        for frase in frases_sem_dados:
-            if frase in texto_pagina:
-                return True
+        # Procura nos eventos por "Previsao de entrega"
+        for evento in eventos:
+            descricao = evento.get('descricao', '')
+            if 'Previsao de entrega' in descricao:
+                match = re.search(r'Previsao de entrega: (\d{2}/\d{2}/\d{2})', descricao)
+                if match:
+                    data_str = match.group(1)  # "20/02/26"
+                    # Converte de DD/MM/AA para DD/MM/YYYY
+                    partes = data_str.split('/')
+                    if len(partes) == 3 and len(partes[2]) == 2:
+                        ano = 2000 + int(partes[2])
+                        previsao_str = f"{partes[0]}/{partes[1]}/{ano}"
+                    else:
+                        previsao_str = data_str
+                    break
         
-        div_geral = soup.find('div', class_='geral')
-        if div_geral:
-            tabelas = div_geral.find_all('table')
-            if len(tabelas) < 2:
-                return True
-            if len(tabelas) >= 2:
-                linhas = tabelas[1].find_all('tr')
-                if len(linhas) <= 1:
-                    return True
+        # Calcula dias restantes
+        dias_restantes = None
+        if previsao_str:
+            try:
+                data_prev = datetime.strptime(previsao_str, '%d/%m/%Y')
+                hoje = datetime.now()
+                dias_restantes = (data_prev - hoje).days
+            except Exception as e:
+                self._log(f"Erro ao calcular dias: {e}", "debug")
         
-        return False
-    
-    def extrair_previsao(self, texto: str) -> Optional[str]:
-        """Extrai data de previsão de entrega"""
-        if not texto:
-            return None
-        
-        padroes = [
-            r'Previsao de entrega:?\s*(\d{2}/\d{2}/\d{2})',
-            r'Previsão de entrega:?\s*(\d{2}/\d{2}/\d{2})',
-            r'previsão:?\s*(\d{2}/\d{2}/\d{2})',
-            r'entrega prevista:?\s*(\d{2}/\d{2}/\d{2})'
-        ]
-        
-        for padrao in padroes:
-            match = re.search(padrao, texto, re.IGNORECASE)
-            if match:
-                return match.group(1)
-        
-        return None
-    
-    def calcular_dias(self, previsao: str) -> Optional[int]:
-        """Calcula dias para a previsão"""
-        if not previsao:
-            return None
-        
-        try:
-            dia, mes, ano = previsao.split('/')
-            data_prev = datetime.strptime(f"20{ano}-{mes}-{dia}", "%Y-%m-%d")
-            data_prev = data_prev.replace(hour=23, minute=59, second=59)
-            
-            hoje = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-            return (data_prev - hoje).days
-        except:
-            return None
-    
-    def extrair_dados_pedido(self, soup: BeautifulSoup) -> Dict:
-        """Extrai dados do pedido"""
-        dados = {
-            'nota_fiscal': '',
-            'numero_pedido': '',
-            'remetente': '',
-            'destinatario': ''
-        }
-        
-        try:
-            tabelas = soup.find_all('table')
-            if not tabelas:
-                return dados
-            
-            linhas = tabelas[0].find_all('tr')
-            for linha in linhas:
-                texto = linha.get_text(strip=True)
-                celulas = linha.find_all('td')
-                
-                if 'N Fiscal:' in texto and len(celulas) > 3:
-                    dados['nota_fiscal'] = celulas[3].get_text(strip=True)
-                elif 'N Pedido:' in texto and len(celulas) > 5:
-                    dados['numero_pedido'] = celulas[5].get_text(strip=True)
-                elif 'Remetente:' in texto and len(celulas) > 1:
-                    dados['remetente'] = celulas[1].get_text(strip=True)
-                elif 'Destinat' in texto and len(celulas) > 1:
-                    dados['destinatario'] = celulas[1].get_text(strip=True)
-                    
-        except Exception as e:
-            pass
-        
-        return dados
-    
-    def extrair_historico(self, soup: BeautifulSoup) -> List[Dict]:
-        """Extrai histórico de rastreamento"""
-        historico = []
-        
-        try:
-            div_geral = soup.find('div', class_='geral')
-            if not div_geral:
-                return historico
-            
-            tabelas = div_geral.find_all('table')
-            if len(tabelas) < 2:
-                return historico
-            
-            linhas = tabelas[1].find_all('tr')
-            
-            for linha in linhas:
-                celulas = linha.find_all('td')
-                if len(celulas) < 3:
-                    continue
-                
-                data_hora = celulas[0].get_text(strip=True).replace('\n', ' ')
-                
-                if not data_hora or data_hora == 'Data/Hora':
-                    continue
-                
-                local = celulas[1].get_text(strip=True).replace('\n', ' ')
-                
-                titulo = celulas[2].find('p', class_='titulo')
-                if titulo:
-                    situacao = titulo.get_text(strip=True)
-                    detalhes = celulas[2].get_text(strip=True).replace(situacao, '').strip()
-                else:
-                    situacao = celulas[2].get_text(strip=True).split('.')[0]
-                    detalhes = celulas[2].get_text(strip=True)
-                
-                historico.append({
-                    'data_hora': data_hora,
-                    'local': local,
-                    'situacao': situacao,
-                    'detalhes': detalhes[:300]
-                })
-                
-        except Exception as e:
-            pass
-        
-        return historico
-    
-    def verificar_entrega(self, historico: List[Dict]) -> Tuple[bool, str, str]:
-        """Verifica se foi entregue"""
-        for evento in historico:
-            if 'ENTREGUE' in evento['situacao'].upper():
-                return True, evento['data_hora'], evento['situacao']
-        return False, '', ''
-    
-    def verificar_devolucao(self, historico: List[Dict]) -> bool:
-        """Verifica se foi devolvido"""
-        for evento in historico:
-            situacao = evento['situacao'].upper()
-            if any(p in situacao for p in ['DEVOLVIDA', 'DEVOLUÇÃO', 'REMETENTE']):
-                return True
-        return False
-    
-    def classificar_status(self, entregue: bool, devolvido: bool, dias: Optional[int], sem_dados: bool = False) -> Dict:
-        """Classifica o status com nomes mais claros"""
-        
-        if sem_dados:
+        return previsao_str, dias_restantes
+
+    def classificar_status(self, eventos: List[Dict]) -> Dict:
+        """
+        Classifica o status baseado nos eventos de rastreamento
+        Retorna: {status, resumo, recomendacao, cor, prioridade}
+        """
+        if not eventos:
             return {
                 'status': 'AGUARDANDO RASTREIO',
                 'status_resumo': 'AGUARDANDO',
-                'recomendacao': 'Sem Rastreio SSW.',
+                'recomendacao': 'Sem rastreio na SSW. Verificar manualmente.',
                 'cor': CORES['SEM_DADOS'],
                 'prioridade': 4
             }
         
+        # Verifica cada evento para identificar situação final
+        entregue = False
+        devolvido = False
+        data_entrega = ""
+        ultimo_status = ""
+        
+        for evento in eventos:
+            ocorrencia = evento.get('ocorrencia', '').upper()
+            descricao = evento.get('descricao', '').upper()
+            
+            # DETECÇÃO DE DEVOLUÇÃO (prioridade máxima)
+            if any(palavra in ocorrencia for palavra in ['DEVOLVIDA', 'DEVOLUÇÃO', 'MERCADORIA DEVOLVIDA']):
+                devolvido = True
+                self._log(f"   🔄 Devolução detectada: {ocorrencia}", "debug")
+                break  # Devolução é status final, não precisa verificar mais
+            
+            # DETECÇÃO DE ENTREGA
+            if 'ENTREGUE' in ocorrencia or 'ENTREGA REALIZADA' in descricao:
+                entregue = True
+                data_entrega = evento.get('data_hora', '').split('T')[0]  # Pega apenas a data
+                self._log(f"   ✅ Entrega detectada: {ocorrencia}", "debug")
+            
+            ultimo_status = ocorrencia
+        
+        # CASO 1: DEVOLVIDO (prioridade máxima)
         if devolvido:
             return {
                 'status': 'DEVOLVIDO AO REMETENTE',
                 'status_resumo': 'DEVOLVIDO',
-                'recomendacao': 'Contatar cliente e transportadora para reenvio',
+                'recomendacao': '❌ Produto devolvido. Contatar cliente e transportadora para reenvio.',
                 'cor': CORES['DEVOLVIDO'],
-                'prioridade': 1
+                'prioridade': 1,
+                'data_entrega': data_entrega
             }
         
+        # CASO 2: ENTREGUE
         if entregue:
             return {
                 'status': 'ENTREGUE',
                 'status_resumo': 'ENTREGUE',
-                'recomendacao': 'Atualizar Intelipost e dar baixa no sistema',
+                'recomendacao': '✅ Entrega realizada. Atualizar Intelipost e dar baixa no sistema.',
                 'cor': CORES['ENTREGUE'],
-                'prioridade': 5
+                'prioridade': 5,
+                'data_entrega': data_entrega
             }
         
-        if dias is None:
+        # CASO 3: EM TRÂNSITO (com ou sem previsão)
+        previsao_str, dias_restantes = self.extrair_previsao_entrega(eventos)
+        
+        if dias_restantes is None:
             return {
                 'status': 'EM TRÂNSITO',
                 'status_resumo': 'TRÂNSITO',
                 'recomendacao': 'Em trânsito, aguardando atualização de previsão',
                 'cor': CORES['PADRAO'],
-                'prioridade': 4
+                'prioridade': 4,
+                'previsao': previsao_str
             }
-        
-        # Atrasado - exibe "ATRASADO A (X Dias)"
-        if dias < 0:
-            dias_atraso = abs(dias)
+        elif dias_restantes < 0:
+            dias_atraso = abs(dias_restantes)
             return {
-                'status': f'ATRASADO A ({dias_atraso} {"dia" if dias_atraso == 1 else "dias"})',
+                'status': f'ATRASADO ({dias_atraso} {"dia" if dias_atraso == 1 else "dias"})',
                 'status_resumo': f'ATRASADO {dias_atraso}d',
-                'recomendacao': f'Cobrar transportadora - Atraso de {dias_atraso} dias',
+                'recomendacao': f'⚠️ Atraso de {dias_atraso} {"dia" if dias_atraso == 1 else "dias"}. Cobrar transportadora.',
                 'cor': CORES['ATRASADO'],
-                'prioridade': 2
+                'prioridade': 2,
+                'previsao': previsao_str
             }
-        
-        # Próximo ao prazo - exibe "PREVISÃO VENCENDO EM (X Dias)"
-        if dias <= 3:
-            if dias == 1:
-                cor = CORES['ALERTA_1DIA']
-                recomendacao = 'ALERTA - Previsão para amanhã'
-            elif dias == 2:
-                cor = CORES['ALERTA_2DIAS']
-                recomendacao = 'Atenção - 2 dias para o prazo'
-            else:  # 3 dias
-                cor = CORES['ALERTA_3DIAS']
-                recomendacao = 'Pré-alerta - 3 dias para o prazo'
-            
+        elif dias_restantes <= 3:
+            textos = {
+                1: '🔴 ALERTA MÁXIMO – Previsão para amanhã!',
+                2: '🟠 Atenção – 2 dias para o prazo final',
+                3: '🟡 Pré-alerta – 3 dias para o prazo final'
+            }
             return {
-                'status': f'PREVISÃO VENCENDO EM ({dias} {"dia" if dias == 1 else "dias"})',
-                'status_resumo': f'{dias}d',
-                'recomendacao': recomendacao,
-                'cor': cor,
-                'prioridade': 3
+                'status': f'PREVISÃO VENCENDO ({dias_restantes} {"dia" if dias_restantes == 1 else "dias"})',
+                'status_resumo': f'{dias_restantes}d',
+                'recomendacao': textos.get(dias_restantes, f'Atenção: prazo em {dias_restantes} dias'),
+                'cor': CORES[f'ALERTA_{dias_restantes}DIAS'],
+                'prioridade': 3,
+                'previsao': previsao_str
             }
-        
-        # No prazo
-        return {
-            'status': f'NO PRAZO ({dias} {"dia" if dias == 1 else "dias restantes"})',
-            'status_resumo': f'{dias}d',
-            'recomendacao': 'Dentro do prazo - Monitorar',
-            'cor': CORES['PADRAO'],
-            'prioridade': 4
-        }
-    
+        else:
+            return {
+                'status': f'NO PRAZO ({dias_restantes} {"dia" if dias_restantes == 1 else "dias restantes"})',
+                'status_resumo': f'{dias_restantes}d',
+                'recomendacao': '✅ Dentro do prazo – monitorar normalmente',
+                'cor': CORES['PADRAO'],
+                'prioridade': 4,
+                'previsao': previsao_str
+            }
+
     def consultar_pedido(self, chave: str) -> Dict:
-        """Consulta um pedido no SSW"""
-        url = f"{self.base_url}/{chave}"
-        self.total_consultas += 1
+        """Consulta a API SSW e processa a resposta"""
+        self._inc('total_consultas')
+        session = self._session()
+        
+        self._log(f"🔍 Consultando: {chave[:20]}...")
         
         try:
-            response = requests.get(url, headers=self.headers, timeout=15)
-            response.raise_for_status()
+            # Usa POST com JSON (funciona perfeitamente)
+            response = session.post(
+                self.API_URL,
+                json={'chave_nfe': chave},
+                timeout=self.timeout
+            )
             
-            soup = BeautifulSoup(response.text, 'html.parser')
-            sem_dados = self.verificar_pagina_sem_dados(soup)
+            if response.status_code != 200:
+                self._inc('total_erros')
+                return self._resultado_erro(chave, f"HTTP {response.status_code}")
             
-            if sem_dados:
-                self.total_sem_dados += 1
-                self._log(f"📭 {chave[:20]}... - AGUARDANDO RASTREIO")
-                
-                dados = self.extrair_dados_pedido(soup)
-                classificacao = self.classificar_status(False, False, None, sem_dados=True)
-                
-                return {
-                    'nota_fiscal': dados['nota_fiscal'],
-                    'numero_pedido': dados['numero_pedido'],
-                    'chave_nfe': chave,
-                    'destinatario': dados['destinatario'],
-                    'remetente': dados['remetente'],
-                    'status': classificacao['status'],
-                    'recomendacao': classificacao['recomendacao'],
-                    'prioridade': classificacao['prioridade'],
-                    'previsao': '',
-                    'data_entrega': '',
-                    'ultima_data': '',
-                    'ultima_situacao': 'Aguardando primeiro registro de rastreio',
-                    'ultimo_local': '',
-                    'total_eventos': 0,
-                    'data_consulta': datetime.now().strftime('%d/%m/%Y %H:%M')
-                }
+            # Tenta parsear como JSON
+            try:
+                dados = response.json()
+            except:
+                # Se não for JSON, tenta converter XML para dict
+                try:
+                    import xmltodict
+                    dados = xmltodict.parse(response.text)
+                except:
+                    self._inc('total_erros')
+                    return self._resultado_erro(chave, "Resposta não é JSON nem XML")
             
-            dados = self.extrair_dados_pedido(soup)
-            historico = self.extrair_historico(soup)
+            # Verifica se a consulta foi bem sucedida
+            success = dados.get('success', False)
+            if not success:
+                self._inc('total_sem_dados')
+                return self._resultado_sem_dados(chave, dados.get('message', 'Documento não encontrado'))
             
-            entregue, data_entrega, situacao = self.verificar_entrega(historico)
-            devolvido = self.verificar_devolucao(historico)
+            # Extrai os dados do documento
+            documento = dados.get('documento', {})
+            header = documento.get('header', {})
             
-            previsao = None
-            dias = None
-            if historico:
-                previsao = self.extrair_previsao(historico[0].get('detalhes', ''))
-                dias = self.calcular_dias(previsao)
+            # O campo pode ser 'tracking' (JSON) ou 'items' (XML convertido)
+            tracking = documento.get('tracking', documento.get('items', []))
             
-            classificacao = self.classificar_status(entregue, devolvido, dias)
-            ultimo = historico[-1] if historico else {}
+            if not tracking:
+                self._inc('total_sem_dados')
+                return self._resultado_sem_dados(chave, 'Sem eventos de rastreamento')
+            
+            # Classifica o status baseado nos eventos
+            classificacao = self.classificar_status(tracking)
+            
+            # Último evento
+            ultimo = tracking[-1]
+            
+            # Formata a data do último evento
+            ultima_data = ultimo.get('data_hora', '')
+            if ultima_data and 'T' in ultima_data:
+                ultima_data = ultima_data.split('T')[0] + ' ' + ultima_data.split('T')[1][:5]
             
             resultado = {
-                'nota_fiscal': dados['nota_fiscal'],
-                'numero_pedido': dados['numero_pedido'],
+                'nota_fiscal': header.get('nro_nf', ''),
+                'numero_pedido': header.get('pedido', ''),
                 'chave_nfe': chave,
-                'destinatario': dados['destinatario'],
-                'remetente': dados['remetente'],
+                'destinatario': header.get('destinatario', ''),
+                'remetente': header.get('remetente', ''),
                 'status': classificacao['status'],
                 'recomendacao': classificacao['recomendacao'],
                 'prioridade': classificacao['prioridade'],
-                'previsao': previsao if previsao else '',
-                'data_entrega': data_entrega if entregue else '',
-                'ultima_data': ultimo.get('data_hora', ''),
-                'ultima_situacao': ultimo.get('situacao', ''),
-                'ultimo_local': ultimo.get('local', ''),
-                'total_eventos': len(historico),
+                'previsao': classificacao.get('previsao', ''),
+                'data_entrega': classificacao.get('data_entrega', ''),
+                'ultima_data': ultima_data,
+                'ultima_situacao': ultimo.get('ocorrencia', ''),
+                'ultimo_local': f"{ultimo.get('cidade', '')} - {ultimo.get('filial', '')}",
+                'total_eventos': len(tracking),
                 'data_consulta': datetime.now().strftime('%d/%m/%Y %H:%M')
             }
             
-            self._log(f"✅ {chave[:20]}... - {classificacao['status_resumo']}")
+            self._inc('total_sucessos')
+            self._log(f"   ✅ {resultado['status']}")
+            
+            # Log especial para devolução
+            if 'DEVOLVIDO' in resultado['status']:
+                self._log(f"   🔄 ATENÇÃO: Devolução detectada!", "aviso")
+            
             return resultado
             
+        except requests.exceptions.Timeout:
+            self._inc('total_erros')
+            return self._resultado_erro(chave, "Timeout na requisição")
         except Exception as e:
-            self.total_erros += 1
-            self._log(f"❌ Erro {chave[:20]}...: {str(e)[:50]}", "erro")
-            return {
-                'nota_fiscal': '',
-                'numero_pedido': '',
-                'chave_nfe': chave,
-                'destinatario': '',
-                'remetente': '',
-                'status': 'ERRO NA CONSULTA',
-                'recomendacao': f'Erro: {str(e)[:100]}. Verificar manualmente.',
-                'prioridade': 1,
-                'previsao': '',
-                'data_entrega': '',
-                'ultima_data': '',
-                'ultima_situacao': 'Erro ao acessar SSW',
-                'ultimo_local': '',
-                'total_eventos': 0,
-                'data_consulta': datetime.now().strftime('%d/%m/%Y %H:%M')
-            }
-    
-    def processar_lote(self, df: pd.DataFrame, max_consultas: int = None) -> pd.DataFrame:
-        """Processa múltiplos pedidos"""
+            self._inc('total_erros')
+            self._log(f"   ❌ Erro: {e}", "erro")
+            return self._resultado_erro(chave, str(e)[:100])
+
+    # ------------------------------------------------------------------
+    # PROCESSAMENTO PARALELO
+    # ------------------------------------------------------------------
+
+    def processar_lote(
+        self,
+        df: pd.DataFrame,
+        max_consultas: int = None,
+        callback_progresso=None
+    ) -> pd.DataFrame:
+        """Processa múltiplos pedidos em paralelo"""
+        
         if max_consultas:
             df = df.head(max_consultas)
         
-        resultados = []
         total = len(df)
+        self._log(f"\n{'='*70}")
+        self._log(f"🚀 PROCESSANDO {total} PEDIDOS | Workers: {self.workers}")
+        self._log(f"{'='*70}\n")
         
-        self._log(f"🚀 Processando {total} pedidos...")
-        
+        # Prepara tarefas
+        tarefas: List[tuple] = []
         for idx, row in df.iterrows():
-            self._log(f"[{idx+1}/{total}] Consultando...")
-            resultado = self.consultar_pedido(row['chave_nfe'])
-            
-            for col in df.columns:
-                if col not in ['chave_nfe', resultado]:
-                    resultado[col] = row[col]
-            
-            resultados.append(resultado)
-            
-            if idx < total - 1:
-                time.sleep(self.delay)
+            chave = row['chave_nfe']
+            extra = {c: row[c] for c in df.columns if c != 'chave_nfe'}
+            tarefas.append((idx, chave, extra))
         
-        return pd.DataFrame(resultados)
-    
+        resultados_ordenados = [None] * total
+        progresso = {'atual': 0}
+        inicio = time.time()
+        
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            future_to_pos = {
+                executor.submit(self.consultar_pedido, chave): (pos, chave, extra)
+                for pos, (idx, chave, extra) in enumerate(tarefas)
+            }
+            
+            for future in as_completed(future_to_pos):
+                pos, chave, extra = future_to_pos[future]
+                try:
+                    resultado = future.result()
+                except Exception as e:
+                    resultado = self._resultado_erro(chave, str(e))
+                
+                # Preserva colunas extras
+                for col, val in extra.items():
+                    if col not in resultado:
+                        resultado[col] = val
+                
+                resultados_ordenados[pos] = resultado
+                
+                with self._lock:
+                    progresso['atual'] += 1
+                    atual = progresso['atual']
+                
+                if callback_progresso:
+                    try:
+                        callback_progresso(atual, total, resultado)
+                    except Exception:
+                        pass
+                
+                # Log de progresso a cada 10% ou 20 itens
+                if atual % max(1, min(20, total // 5)) == 0 or atual == total:
+                    elapsed = time.time() - inicio
+                    taxa = atual / elapsed if elapsed > 0 else 0
+                    restante = (total - atual) / taxa if taxa > 0 else 0
+                    self._log(f"📊 Progresso: [{atual}/{total}] - {taxa:.1f} req/s - ~{int(restante)}s restantes")
+        
+        elapsed_total = time.time() - inicio
+        self._log(f"\n✅ PROCESSAMENTO CONCLUÍDO em {elapsed_total:.1f} segundos")
+        self._log(f"   Média: {total/elapsed_total:.1f} consultas/segundo\n")
+        
+        return pd.DataFrame(resultados_ordenados)
+
+    # ------------------------------------------------------------------
+    # HELPERS DE RETORNO
+    # ------------------------------------------------------------------
+
+    def _resultado_erro(self, chave: str, motivo: str) -> Dict:
+        return {
+            'nota_fiscal': '', 
+            'numero_pedido': '', 
+            'chave_nfe': chave,
+            'destinatario': '', 
+            'remetente': '',
+            'status': 'ERRO NA CONSULTA',
+            'recomendacao': f'❌ Erro: {motivo}. Verificar manualmente.',
+            'prioridade': 1, 
+            'previsao': '', 
+            'data_entrega': '',
+            'ultima_data': '', 
+            'ultima_situacao': 'Erro ao consultar API',
+            'ultimo_local': '', 
+            'total_eventos': 0,
+            'data_consulta': datetime.now().strftime('%d/%m/%Y %H:%M')
+        }
+
+    def _resultado_sem_dados(self, chave: str, mensagem: str = "") -> Dict:
+        return {
+            'nota_fiscal': '', 
+            'numero_pedido': '', 
+            'chave_nfe': chave,
+            'destinatario': '', 
+            'remetente': '',
+            'status': 'AGUARDANDO RASTREIO',
+            'recomendacao': '📭 Sem rastreio na SSW. Verificar manualmente.',
+            'prioridade': 4, 
+            'previsao': '', 
+            'data_entrega': '',
+            'ultima_data': '', 
+            'ultima_situacao': mensagem or 'Nenhum dado encontrado',
+            'ultimo_local': '', 
+            'total_eventos': 0,
+            'data_consulta': datetime.now().strftime('%d/%m/%Y %H:%M')
+        }
+
+    # ------------------------------------------------------------------
+    # GERAÇÃO DE RELATÓRIOS
+    # ------------------------------------------------------------------
+
     def gerar_relatorios(self, df: pd.DataFrame, nome_base: str):
-        """Gera relatórios com formatação por cores"""
+        """Gera relatórios Excel e CSV formatados"""
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         
-
-        # ============================================
-    # DEBUG: Verificar os dados antes de gerar
-    # ============================================
-        self._log(f"\n🔍 DEBUG - DADOS RECEBIDOS:")
-        self._log(f"   Total de linhas: {len(df)}")
-        self._log(f"   Colunas: {df.columns.tolist()}")
-        self._log(f"   Primeiros status:")
-        for i, status in enumerate(df['status'].head(10)):
-            self._log(f"      {i+1}: '{status}' (tipo: {type(status).__name__})")
-    
-    # Verifica se tem status vazio
-        vazios = df[df['status'].isna()].shape[0]
-        if vazios > 0:
-            self._log(f"   ⚠️ Status vazios: {vazios}")
-
-        # Estatísticas
+        # Estatísticas detalhadas
         entregues = df[df['status'].str.contains('ENTREGUE', na=False)].shape[0]
-        aguardando = df[df['status'].str.contains('AGUARDANDO RASTREIO', na=False)].shape[0]
-        atrasados = df[df['status'].str.contains('ATRASADO', na=False)].shape[0]
         devolvidos = df[df['status'].str.contains('DEVOLVIDO', na=False)].shape[0]
+        atrasados = df[df['status'].str.contains('ATRASADO', na=False)].shape[0]
+        alerta = df[df['status'].str.contains('PREVISÃO VENCENDO', na=False)].shape[0]
+        aguardando = df[df['status'].str.contains('AGUARDANDO', na=False)].shape[0]
         erros = df[df['status'].str.contains('ERRO', na=False)].shape[0]
         
-        self._log(f"\n📊 RESUMO:")
-        self._log(f"   ✅ Entregues: {entregues}")
-        self._log(f"   📭 Aguardando rastreio: {aguardando}")
-        self._log(f"   ⚠️ Atrasados: {atrasados}")
-        self._log(f"   🔄 Devolvidos: {devolvidos}")
-        self._log(f"   ❌ Erros: {erros}")
+        # Em trânsito = todos menos os classificados
+        em_transito = len(df) - entregues - devolvidos - atrasados - alerta - aguardando - erros
         
-        # ============================================
-        # RELATÓRIO PRINCIPAL COM CORES
-        # ============================================
+        self._log(f"\n{'='*70}")
+        self._log(f"📊 RESUMO FINAL DO RASTREAMENTO:")
+        self._log(f"{'='*70}")
+        self._log(f"   ✅ ENTREGUES:        {entregues}")
+        self._log(f"   🔄 DEVOLVIDOS:       {devolvidos}")
+        self._log(f"   🚚 EM TRÂNSITO:      {em_transito}")
+        self._log(f"   ⚠️ ATRASADOS:        {atrasados}")
+        self._log(f"   🟡 PREVISÃO VENCENDO: {alerta}")
+        self._log(f"   📭 AGUARDANDO:       {aguardando}")
+        self._log(f"   ❌ ERROS:            {erros}")
+        self._log(f"{'='*70}\n")
+        
+        # Gera Excel
         arquivo = f"{nome_base}_rastreamento_{timestamp}.xlsx"
         
-        # Ordem das colunas
         ordem_colunas = [
             'nota_fiscal', 'numero_pedido', 'destinatario',
-            'status', 'recomendacao',
-            'previsao', 'data_entrega',
+            'status', 'recomendacao', 'previsao', 'data_entrega',
             'ultima_data', 'ultima_situacao', 'ultimo_local',
             'total_eventos', 'data_consulta'
         ]
         
-        # Adiciona colunas originais
+        # Adiciona colunas extras que existirem
         for col in df.columns:
             if col not in ordem_colunas and col not in ['chave_nfe', 'remetente', 'prioridade']:
                 ordem_colunas.append(col)
         
         colunas_existentes = [c for c in ordem_colunas if c in df.columns]
-        df_relatorio = df[colunas_existentes].copy()
+        df_rel = df[colunas_existentes].copy()
         
-        with pd.ExcelWriter(arquivo, engine='openpyxl') as writer:
-            df_relatorio.to_excel(writer, index=False, sheet_name='Rastreamento')
-            
-            workbook = writer.book
-            worksheet = writer.sheets['Rastreamento']
-            
+        try:
+            from openpyxl import Workbook
             from openpyxl.styles import PatternFill, Font, Alignment
             from openpyxl.utils import get_column_letter
             
-            CORES_EXCEL = {
-                'ENTREGUE': CORES['ENTREGUE'],
-                'AGUARDANDO RASTREIO': CORES['SEM_DADOS'],
-                'DEVOLVIDO': CORES['DEVOLVIDO'],
-                'ATRASADO': CORES['ATRASADO'],
-                'PREVISÃO VENCENDO EM (1 dia)': CORES['ALERTA_1DIA'],
-                'PREVISÃO VENCENDO EM (2 dias)': CORES['ALERTA_2DIAS'],
-                'PREVISÃO VENCENDO EM (3 dias)': CORES['ALERTA_3DIAS'],
-                'ERRO': CORES['ERRO']
-            }
-            
-            # Cabeçalho
-            for col in range(1, len(colunas_existentes) + 1):
-                cell = worksheet.cell(row=1, column=col)
-                cell.font = Font(bold=True, color='FFFFFF')
-                cell.fill = PatternFill(start_color='2F5496', end_color='2F5496', fill_type='solid')
-                cell.alignment = Alignment(horizontal='center')
-            
-            # Aplicar cores
-            for row in range(2, len(df_relatorio) + 2):
-                status = str(df.iloc[row-2].get('status', ''))
-                cor_fundo = CORES['PADRAO']
+            with pd.ExcelWriter(arquivo, engine='openpyxl') as writer:
+                df_rel.to_excel(writer, index=False, sheet_name='Rastreamento')
                 
-                if 'ENTREGUE' in status:
-                    cor_fundo = CORES_EXCEL['ENTREGUE']
-                elif 'AGUARDANDO RASTREIO' in status:
-                    cor_fundo = CORES_EXCEL['AGUARDANDO RASTREIO']
-                elif 'DEVOLVIDO' in status:
-                    cor_fundo = CORES_EXCEL['DEVOLVIDO']
-                elif 'ATRASADO' in status:
-                    cor_fundo = CORES_EXCEL['ATRASADO']
-                elif 'PREVISÃO VENCENDO EM (1 dia)' in status:
-                    cor_fundo = CORES_EXCEL['PREVISÃO VENCENDO EM (1 dia)']
-                elif 'PREVISÃO VENCENDO EM (2 dias)' in status:
-                    cor_fundo = CORES_EXCEL['PREVISÃO VENCENDO EM (2 dias)']
-                elif 'PREVISÃO VENCENDO EM (3 dias)' in status:
-                    cor_fundo = CORES_EXCEL['PREVISÃO VENCENDO EM (3 dias)']
-                elif 'ERRO' in status:
-                    cor_fundo = CORES_EXCEL['ERRO']
+                workbook = writer.book
+                worksheet = writer.sheets['Rastreamento']
                 
-                if cor_fundo != CORES['PADRAO']:
-                    for col in range(1, len(colunas_existentes) + 1):
-                        worksheet.cell(row=row, column=col).fill = PatternFill(start_color=cor_fundo, end_color=cor_fundo, fill_type='solid')
+                # Formata cabeçalho
+                header_fill = PatternFill(start_color='2F5496', end_color='2F5496', fill_type='solid')
+                header_font = Font(bold=True, color='FFFFFF')
+                
+                for col in range(1, len(colunas_existentes) + 1):
+                    cell = worksheet.cell(row=1, column=col)
+                    cell.font = header_font
+                    cell.fill = header_fill
+                    cell.alignment = Alignment(horizontal='center')
+                
+                # Aplica cores baseado no status
+                status_cores = {
+                    'ENTREGUE': CORES['ENTREGUE'],
+                    'DEVOLVIDO': CORES['DEVOLVIDO'],
+                    'ATRASADO': CORES['ATRASADO'],
+                }
+                
+                for row in range(2, len(df_rel) + 2):
+                    status = str(df.iloc[row - 2].get('status', ''))
+                    cor_fundo = CORES['PADRAO']
+                    
+                    for key, cor in status_cores.items():
+                        if key in status:
+                            cor_fundo = cor
+                            break
+                    
+                    if 'PREVISÃO VENCENDO' in status:
+                        if '(1' in status:
+                            cor_fundo = CORES['ALERTA_1DIA']
+                        elif '(2' in status:
+                            cor_fundo = CORES['ALERTA_2DIAS']
+                        else:
+                            cor_fundo = CORES['ALERTA_3DIAS']
+                    elif 'ERRO' in status:
+                        cor_fundo = CORES['ERRO']
+                    elif 'AGUARDANDO' in status:
+                        cor_fundo = CORES['SEM_DADOS']
+                    
+                    if cor_fundo != CORES['PADRAO']:
+                        fill = PatternFill(start_color=cor_fundo, end_color=cor_fundo, fill_type='solid')
+                        for col in range(1, len(colunas_existentes) + 1):
+                            worksheet.cell(row=row, column=col).fill = fill
+                
+                # Ajusta largura das colunas
+                for col in worksheet.columns:
+                    max_len = 0
+                    col_letter = get_column_letter(col[0].column)
+                    for cell in col:
+                        try:
+                            max_len = max(max_len, len(str(cell.value)))
+                        except:
+                            pass
+                    worksheet.column_dimensions[col_letter].width = min(max_len + 2, 50)
             
-            # Ajusta largura
-            for col in worksheet.columns:
-                max_len = 0
-                col_letter = get_column_letter(col[0].column)
-                for cell in col:
-                    try:
-                        max_len = max(max_len, len(str(cell.value)))
-                    except:
-                        pass
-                worksheet.column_dimensions[col_letter].width = min(max_len + 2, 50)
-        
-        self._log(f"✅ Relatório com cores: {arquivo}")
-        
-        # ============================================
-        # RELATÓRIO INTELIPOST (apenas entregues) - CORRIGIDO
-        # ============================================
-        entregues_df = df[df['status'].str.contains('ENTREGUE', na=False)].copy()
-        
-        if not entregues_df.empty:
-            arquivo2 = f"{nome_base}_intelipost_{timestamp}.csv"
+            self._log(f"✅ Relatório Excel gerado: {arquivo}")
             
-            # Verifica se tem data_entrega, se não, cria uma coluna vazia
-            if 'data_entrega' not in entregues_df.columns:
-                entregues_df['data_entrega'] = ''
+            # Gera CSV para Intelipost se houver entregues
+            if entregues > 0:
+                arquivo_csv = f"{nome_base}_intelipost_{timestamp}.csv"
+                entregues_df = df[df['status'].str.contains('ENTREGUE', na=False)].copy()
+                
+                col_pedido = None
+                for col in ['numero_pedido', 'nota_fiscal', 'chave_nfe']:
+                    if col in entregues_df.columns and entregues_df[col].notna().any():
+                        col_pedido = col
+                        break
+                
+                if col_pedido:
+                    pd.DataFrame({
+                        'numero_pedido': entregues_df[col_pedido],
+                        'data_entrega': entregues_df['data_entrega'],
+                        'status': 'ENTREGUE'
+                    }).to_csv(arquivo_csv, index=False, encoding='utf-8-sig')
+                    self._log(f"✅ CSV Intelipost gerado: {arquivo_csv}")
             
-            # Determina a coluna do número do pedido
-            if 'numero_pedido' in entregues_df.columns and entregues_df['numero_pedido'].notna().any():
-                col_pedido = 'numero_pedido'
-            elif 'nota_fiscal' in entregues_df.columns:
-                col_pedido = 'nota_fiscal'
-            else:
-                col_pedido = 'chave_nfe'
+            # Gera relatório de devoluções separado
+            if devolvidos > 0:
+                arquivo_dev = f"{nome_base}_devolucoes_{timestamp}.csv"
+                devolvidos_df = df[df['status'].str.contains('DEVOLVIDO', na=False)].copy()
+                devolvidos_df.to_csv(arquivo_dev, index=False, encoding='utf-8-sig')
+                self._log(f"⚠️ Relatório de devoluções gerado: {arquivo_dev}")
             
-            # Cria DataFrame para Intelipost
-            df_intel = pd.DataFrame({
-                'numero_pedido': entregues_df[col_pedido],
-                'data_entrega': entregues_df['data_entrega'],
-                'status': 'ENTREGUE'
-            })
-            
-            df_intel.to_csv(arquivo2, index=False, encoding='utf-8-sig')
-            self._log(f"✅ Intelipost: {arquivo2}")
+        except Exception as e:
+            self._log(f"❌ Erro ao gerar relatório: {e}", "erro")
 
 
 # ============================================
-# FUNÇÃO PRINCIPAL (para linha de comando)
+# TESTE RÁPIDO
 # ============================================
 
-def main():
-    """Função principal para executar via linha de comando"""
+def testar_chave_unica():
+    """Função para testar uma única chave"""
+    print("\n" + "="*70)
+    print(" TESTE DE CONSULTA SSW - VERSÃO FINAL")
+    print("="*70)
     
-    print("\n" + "="*60)
-    print(" SISTEMA DE RASTREAMENTO SSW - Versão 4.2")
-    print("="*60 + "\n")
+    chave = input("\nDigite a chave NF-e (44 dígitos): ").strip()
+    chave = re.sub(r'[^0-9]', '', chave)
     
-    ARQUIVO_ENTRADA = "pedidos_ssw.xlsx"
-    COLUNA_XML = "XML"
-    MAX_CONSULTAS = None
-    DELAY = 1
-    
-    if not os.path.exists(ARQUIVO_ENTRADA):
-        print(f"❌ Arquivo não encontrado: {ARQUIVO_ENTRADA}")
+    if len(chave) != 44:
+        print(f"❌ Chave inválida! Tem {len(chave)} dígitos, deveria ter 44")
         return
     
-    try:
-        processador = ProcessadorSSW(delay_consultas=DELAY)
-        
-        print("📂 PASSO 1: Lendo planilha...")
-        df = processador.ler_planilha(ARQUIVO_ENTRADA, COLUNA_XML)
-        
-        if df.empty:
-            print("❌ Nenhuma chave válida encontrada!")
-            return
-        
-        print("\n🔍 PASSO 2: Consultando SSW...")
-        resultados = processador.processar_lote(df, MAX_CONSULTAS)
-        
-        print("\n📊 PASSO 3: Gerando relatórios...")
-        nome_base = Path(ARQUIVO_ENTRADA).stem
-        processador.gerar_relatorios(resultados, nome_base)
-        
-        entregues = resultados[resultados['status'].str.contains('ENTREGUE', na=False)].shape[0]
-        
-        print("\n" + "="*60)
-        print("✅ PROCESSO CONCLUÍDO!")
-        print("="*60)
-        print(f"📦 Total de pedidos: {len(resultados)}")
-        print(f"✅ Entregues: {entregues}")
-        print(f"❌ Erros: {processador.total_erros}")
-        print("="*60)
-        
-    except Exception as e:
-        print(f"\n❌ Erro: {e}")
+    processador = ProcessadorSSW(workers=1)
+    print("\n🔍 Consultando API...\n")
+    
+    resultado = processador.consultar_pedido(chave)
+    
+    print("\n" + "="*70)
+    print(" RESULTADO DA CONSULTA:")
+    print("="*70)
+    for key, value in resultado.items():
+        if value:
+            print(f"   {key}: {value}")
+    print("="*70)
+    
+    # Salva resultado em JSON
+    with open('consulta_resultado.json', 'w', encoding='utf-8') as f:
+        json.dump(resultado, f, ensure_ascii=False, indent=2)
+    print("\n📄 Resultado salvo em: consulta_resultado.json")
 
 
 if __name__ == "__main__":
-    main()
+    testar_chave_unica()

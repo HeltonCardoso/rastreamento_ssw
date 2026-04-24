@@ -3,141 +3,193 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SSW Rastreamento - Sistema Profissional</title>
+    <title>SSW Rastreamento - Dashboard</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
-    <div class="container">
-        <div class="card">
-            <div class="header">
-                <div>
-                    <h1>
-                        🚀 SSW Rastreamento
-                        <span class="badge">TEMPO REAL</span>
-                    </h1>
-                    <p class="subtitle">Sistema profissional de rastreamento de cargas</p>
+    <div class="app-container">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <h2>🚚 SSW Rastreamento</h2>
+                <p>Sistema Profissional</p>
+            </div>
+            
+            <div class="sidebar-menu">
+                <div class="menu-item active">
+                    <i class="fas fa-tachometer-alt"></i>
+                    <span>Dashboard</span>
+                </div>
+                <div class="menu-item">
+                    <i class="fas fa-chart-line"></i>
+                    <span>Relatórios</span>
+                </div>
+                <div class="menu-item">
+                    <i class="fas fa-history"></i>
+                    <span>Histórico</span>
                 </div>
             </div>
             
-            <!-- Área de formulário -->
-            <div id="form-area" class="form-area">
-                <!-- Opção de fonte -->
-                <div class="form-row">
-                    <div class="form-group" style="flex: 2;">
-                        <label>🔗 Fonte dos dados</label>
-                        <div style="display: flex; gap: 20px;">
-                            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
-                                <input type="radio" name="fonte" value="arquivo" checked onclick="toggleFonte()"> 📁 Arquivo Local
-                            </label>
-                            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
-                                <input type="radio" name="fonte" value="google" onclick="toggleFonte()"> 🌐 Google Sheets (configurado)
-                            </label>
-                        </div>
-                    </div>
+            <div class="config-section">
+                <div class="config-item">
+                    <label>⚡ Workers (threads)</label>
+                    <input type="number" id="workers" value="5" min="1" max="15">
                 </div>
-
-                <!-- Campo para arquivo local -->
-                <div id="campo-arquivo">
-                    <div class="form-group">
-                        <label>📁 Planilha de pedidos</label>
-                        <input type="file" id="arquivo" accept=".xlsx,.xls,.csv">
-                    </div>
+                <div class="config-item">
+                    <label>📝 Coluna da chave NF-e</label>
+                    <input type="text" id="coluna_xml" value="xml">
+                    <small style="font-size: 0.7em; opacity: 0.6;">Nome da coluna na planilha</small>
                 </div>
-
-                <!-- Aviso para Google Sheets (já configurado) -->
-                <div id="campo-google" class="hidden">
-                    <div class="info-box" style="background: #e8f0fe; padding: 12px; border-radius: 12px;">
-                        <p style="margin: 0; color: #1a73e8;">✅ Google Sheets já configurado!</p>
-                        <small style="color: #5f6368;">Planilha: {{ google_sheets_url }}</small>
-                    </div>
-                </div>
-
-                <!-- Campos comuns -->
-                <div class="form-row">
-                    <div class="form-group">
-                        <label>📝 Coluna com XML/chave</label>
-                        <input type="text" id="coluna_xml" value="xml">
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>⏱️ Delay (segundos)</label>
-                        <input type="number" id="delay" value="1.5" step="0.5" min="0.5" max="5">
-                    </div>
-                    
-                    <div class="form-group">
-                        <button class="btn-primary" id="btn-iniciar" onclick="iniciarProcessamento()">▶ INICIAR</button>
-                    </div>
+                <div class="config-item">
+                    <label>
+                        <input type="checkbox" id="auto-refresh"> 🔄 Auto-refresh
+                    </label>
                 </div>
             </div>
             
-            <!-- Área de progresso -->
-            <div id="progresso-area" class="hidden">
-                <div class="dashboard">
-                    <div class="stat-card">
-                        <div class="stat-number entregue" id="stat-entregues">0</div>
-                        <div class="stat-label">✅ ENTREGUES</div>
+            <!-- Info Google Sheets -->
+            <div class="info-box">
+                <p><i class="fas fa-cloud"></i> <strong>Google Sheets</strong></p>
+                <p style="font-size: 0.75em;">Planilha conectada automaticamente</p>
+                <p style="font-size: 0.7em; word-break: break-all;" id="sheet-url">{{ google_sheets_url }}</p>
+            </div>
+        </div>
+        
+        <!-- Main Content -->
+        <div class="main-content">
+            <!-- Top Bar -->
+            <div class="top-bar">
+                <div class="page-title">
+                    <h1>Dashboard de Rastreamento</h1>
+                    <p>Monitoramento em tempo real das suas cargas</p>
+                </div>
+                <div class="connection-status">
+                    <span class="status-badge status-online" id="conn-status">
+                        <i class="fas fa-check-circle"></i> Google Sheets Conectado
+                    </span>
+                </div>
+            </div>
+            
+            <!-- Métricas -->
+            <div class="metrics-grid">
+                <div class="metric-card entregue">
+                    <div class="metric-icon">✅</div>
+                    <div class="metric-value" id="metric-entregues">0</div>
+                    <div class="metric-label">ENTREGAS</div>
+                </div>
+                
+                <div class="metric-card transito">
+                    <div class="metric-icon">🚚</div>
+                    <div class="metric-value" id="metric-transito">0</div>
+                    <div class="metric-label">EM TRÂNSITO</div>
+                </div>
+                
+                <div class="metric-card alerta">
+                    <div class="metric-icon">⚠️</div>
+                    <div class="metric-value" id="metric-alerta">0</div>
+                    <div class="metric-label">PREVISÃO (1-3d)</div>
+                </div>
+                
+                <div class="metric-card atrasado">
+                    <div class="metric-icon">🔴</div>
+                    <div class="metric-value" id="metric-atrasados">0</div>
+                    <div class="metric-label">ATRASADOS</div>
+                </div>
+                
+                <div class="metric-card devolvido">
+                    <div class="metric-icon">🔄</div>
+                    <div class="metric-value" id="metric-devolvidos">0</div>
+                    <div class="metric-label">DEVOLVIDOS</div>
+                </div>
+                
+                <div class="metric-card erro">
+                    <div class="metric-icon">❌</div>
+                    <div class="metric-value" id="metric-erros">0</div>
+                    <div class="metric-label">ERROS</div>
+                </div>
+            </div>
+            
+            <!-- Gráfico -->
+            <div class="chart-container">
+                <div class="chart-header">
+                    <div class="chart-title">📊 Distribuição de Status</div>
+                    <button class="refresh-btn" onclick="carregarDadosHistorico()">
+                        <i class="fas fa-sync-alt"></i> Atualizar
+                    </button>
+                </div>
+                <canvas id="statusChart" height="80"></canvas>
+            </div>
+            
+            <!-- Progresso -->
+            <div class="progress-section" id="progress-section" style="display: none;">
+                <div class="progress-bar-container">
+                    <div class="progress-bar-fill" id="progress-bar">0%</div>
+                </div>
+                <div class="progress-stats">
+                    <span id="progress-current">0</span>
+                    <span id="progress-total">0</span>
+                    <span id="progress-speed">0 req/s</span>
+                </div>
+            </div>
+            
+            <!-- Tabelas -->
+            <div class="tables-grid">
+                <div class="table-card">
+                    <div class="table-header">
+                        <span>📋 Últimos Processados</span>
+                        <span>Últimas 10</span>
                     </div>
-                    <div class="stat-card">
-                        <div class="stat-number pendente" id="stat-pendentes">0</div>
-                        <div class="stat-label">⏳ EM TRÂNSITO</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number" id="stat-alertas">0</div>
-                        <div class="stat-label">⚠️ ALERTAS (1-3d)</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number atrasado" id="stat-atrasados">0</div>
-                        <div class="stat-label">🔴 ATRASADOS</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number devolvido" id="stat-devolvidos">0</div>
-                        <div class="stat-label">🔄 DEVOLVIDOS</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number" id="stat-erros">0</div>
-                        <div class="stat-label">❌ ERROS</div>
+                    <div class="table-content">
+                        <table id="ultimos-table">
+                            <thead>
+                                <tr><th>Hora</th><th>NF</th><th>Destinatário</th><th>Status</th></tr>
+                            </thead>
+                            <tbody id="ultimos-body">
+                                <tr><td colspan="4">Aguardando processamento...</td></tr>
+                            </tbody>
+                        </table>
                     </div>
                 </div>
                 
-                <div class="progress-container">
-                    <div class="progress-bar" id="progress-bar"></div>
-                </div>
-                
-                <div id="status-mensagem" class="status-info"></div>
-                
-                <div class="results-grid">
-                    <div class="table-container">
-                        <div class="table-header">📋 ÚLTIMOS PROCESSADOS</div>
-                        <div class="table-content">
-                            <table id="ultimos-table">
-                                <thead>
-                                    <tr><th>Hora</th><th>Nota Fiscal</th><th>Cliente</th><th>Status</th></tr>
-                                </thead>
-                                <tbody id="ultimos-body">
-                                    <tr><td colspan="4">Aguardando processamento...</td></tr>
-                                </tbody>
-                            </table>
-                        </div>
+                <div class="table-card">
+                    <div class="table-header">
+                        <span>⚠️ Alertas e Atrasos</span>
+                        <span>Prioridade alta</span>
                     </div>
-                    
-                    <div class="table-container">
-                        <div class="table-header">📊 RESUMO POR STATUS</div>
-                        <div class="table-content">
-                            <table id="resumo-status">
-                                <thead><tr><th>Status</th><th>Quantidade</th></tr></thead>
-                                <tbody id="resumo-body">
-                                    <tr><td colspan="2">Aguardando processamento...</td></tr>
-                                </tbody>
-                            </table>
-                        </div>
+                    <div class="table-content">
+                        <table id="alertas-table">
+                            <thead><tr><th>NF</th><th>Status</th><th>Previsão</th><th>Dias</th></tr></thead>
+                            <tbody id="alertas-body">70-<td colspan="4">Nenhum alerta...</td></tr></tbody>
+                        </table>
                     </div>
                 </div>
-                
-                <div class="action-buttons">
-                    <button onclick="cancelarProcessamento()" class="btn-danger" id="btn-cancelar" style="display: none;">⏸ CANCELAR</button>
-                    <button onclick="novoProcessamento()" class="btn-primary" id="btn-novo" style="display: none;">📁 NOVO PROCESSAMENTO</button>
-                    <div id="download-area" class="download-area"></div>
-                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- BOTÕES FLUTUANTES -->
+    <div class="floating-actions">
+        <button class="floating-btn floating-btn-primary" id="btn-iniciar" data-tooltip="Iniciar Processamento" onclick="iniciarProcessamento()">
+            <i class="fas fa-play"></i>
+        </button>
+        <button class="floating-btn floating-btn-danger" id="btn-cancelar" data-tooltip="Cancelar" onclick="cancelarProcessamento()" style="display: none;">
+            <i class="fas fa-stop"></i>
+        </button>
+        <button class="floating-btn floating-btn-success" id="btn-download" data-tooltip="Baixar Excel" onclick="baixarRelatorio()" style="display: none;">
+            <i class="fas fa-download"></i>
+        </button>
+    </div>
+    
+    <!-- Modal -->
+    <div id="modal" class="modal">
+        <div class="modal-content">
+            <h3>⚠️ Confirmar</h3>
+            <p id="modal-message">Tem certeza?</p>
+            <div class="modal-buttons">
+                <button onclick="fecharModal()" style="padding: 10px 20px; background: #ccc; border: none; border-radius: 8px; cursor: pointer;">Não</button>
+                <button id="modal-confirm" style="padding: 10px 20px; background: #dc3545; color: white; border: none; border-radius: 8px; cursor: pointer;">Sim</button>
             </div>
         </div>
     </div>
