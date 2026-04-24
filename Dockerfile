@@ -7,7 +7,6 @@ RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
     python3-dev \
-    libatlas-base-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Copiar requirements primeiro (melhor para cache)
